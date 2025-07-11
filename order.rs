@@ -396,119 +396,144 @@ where
         }
     }
 
-    async fn get_valid_orders(
-        &self,
+async fn get_valid_orders(
+    &self,
+    current_block_timestamp: u64,
+    min_deadline: u64,
+) -> Result<Vec<Arc<OrderRequest>>> {
+    let mut candidate_orders: Vec<Arc<OrderRequest>> = Vec::new();
+
+    fn is_within_deadline(
+        order: &OrderRequest,
         current_block_timestamp: u64,
         min_deadline: u64,
-    ) -> Result<Vec<Arc<OrderRequest>>> {
-        let mut candidate_orders: Vec<Arc<OrderRequest>> = Vec::new();
+    ) -> bool {
+        if order.request.expires_at() < current_block_timestamp {
+            tracing::debug!("Request {:x} has now expired. Skipping.", order.request.id);
+            false
+        } else if order.request.expires_at().saturating_sub(now_timestamp()) < min_deadline {
+            tracing::debug!(
+                "Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.",
+                order.request.id,
+                order.request.expires_at(),
+                min_deadline
+            );
+            false
+        } else {
+            true
+        }
+    }
 
-        fn is_within_deadline(
-            order: &OrderRequest,
-            current_block_timestamp: u64,
-            min_deadline: u64,
-        ) -> bool {
-            if order.request.expires_at() < current_block_timestamp {
-                tracing::debug!("Request {:x} has now expired. Skipping.", order.request.id);
-                false
-            } else if order.request.expires_at().saturating_sub(now_timestamp()) < min_deadline {
-                tracing::debug!("Request {:x} deadline at {} is less than the minimum deadline {} seconds required to prove an order. Skipping.", order.request.id, order.request.expires_at(), min_deadline);
-                false
-            } else {
-                true
-            }
+    fn is_target_time_reached(order: &OrderRequest, current_block_timestamp: u64) -> bool {
+        // For LockAndFulfill orders, always consider them ready (bypass target_timestamp check)
+        if order.fulfillment_type == FulfillmentType::LockAndFulfill {
+            tracing::trace!(
+                "Request {:x} is LockAndFulfill, bypassing target timestamp check for immediate locking",
+                order.request.id
+            );
+            return true;
         }
 
-        fn is_target_time_reached(order: &OrderRequest, current_block_timestamp: u64) -> bool {
-            // Note: this could use current timestamp, but avoiding cases where clock has drifted.
-            match order.target_timestamp {
-                Some(target_timestamp) => {
-                    if current_block_timestamp < target_timestamp {
-                        tracing::trace!(
-                            "Request {:x} target timestamp {} not yet reached (current: {}). Waiting.",
-                            order.request.id,
-                            target_timestamp,
-                            current_block_timestamp
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                }
-                None => {
-                    // Should not happen, just warning for safety as this condition is not strictly
-                    // enforced at compile time.
-                    tracing::warn!("Request {:x} has no target timestamp set", order.request.id);
+        // For other fulfillment types, check target_timestamp as before
+        match order.target_timestamp {
+            Some(target_timestamp) => {
+                if current_block_timestamp < target_timestamp {
+                    tracing::trace!(
+                        "Request {:x} target timestamp {} not yet reached (current: {}). Waiting.",
+                        order.request.id,
+                        target_timestamp,
+                        current_block_timestamp
+                    );
                     false
+                } else {
+                    true
                 }
             }
+            None => {
+                tracing::warn!("Request {:x} has no target timestamp set", order.request.id);
+                false
+            }
         }
+    }
 
-        for (_, order) in self.prove_cache.iter() {
-            let is_fulfilled = self
-                .db
-                .is_request_fulfilled(U256::from(order.request.id))
-                .await
-                .context("Failed to check if request is fulfilled")?;
-            if is_fulfilled {
+    for (_, order) in self.prove_cache.iter() {
+        let is_fulfilled = self
+            .db
+            .is_request_fulfilled(U256::from(order.request.id))
+            .await
+            .context("Failed to check if request is fulfilled")?;
+        if is_fulfilled {
+            tracing::debug!(
+                "Request 0x{:x} was locked by another prover and was fulfilled. Skipping.",
+                order.request.id
+            );
+            self.skip_order(&order, "was fulfilled by other").await;
+        } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
+            self.skip_order(&order, "expired").await;
+        } else if is_target_time_reached(&order, current_block_timestamp) {
+            tracing::info!(
+                "Request 0x{:x} was locked by another prover but expired unfulfilled, setting status to pending proving",
+                order.request.id
+            );
+            candidate_orders.push(order);
+        }
+    }
+
+    for (_, order) in self.lock_and_prove_cache.iter() {
+        let is_lock_expired = order.request.lock_expires_at() < current_block_timestamp;
+        if is_lock_expired {
+            tracing::debug!(
+                "Request {:x} was scheduled to be locked by us, but its lock has now expired. Skipping.",
+                order.request.id
+            );
+            self.skip_order(&order, "lock expired before we locked").await;
+        } else if let Some((locker, _)) =
+            self.db.get_request_locked(U256::from(order.request.id)).await?
+        {
+            let our_address = self.provider.default_signer_address().to_string().to_lowercase();
+            let locker_address = locker.to_lowercase();
+            // Compare normalized addresses (lowercase without 0x prefix)
+            let our_address_normalized = our_address.trim_start_matches("0x");
+            let locker_address_normalized = locker_address.trim_start_matches("0x");
+
+            if locker_address_normalized != our_address_normalized {
                 tracing::debug!(
-                    "Request 0x{:x} was locked by another prover and was fulfilled. Skipping.",
+                    "Request 0x{:x} was scheduled to be locked by us ({}), but is already locked by another prover ({}). Skipping.",
+                    order.request.id,
+                    our_address,
+                    locker_address
+                );
+                self.skip_order(&order, "locked by another prover").await;
+            } else {
+                tracing::debug!(
+                    "Request 0x{:x} was scheduled to be locked by us, but is already locked by us. Proceeding to prove.",
                     order.request.id
                 );
-                self.skip_order(&order, "was fulfilled by other").await;
-            } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
-                self.skip_order(&order, "expired").await;
-            } else if is_target_time_reached(&order, current_block_timestamp) {
-                tracing::info!("Request 0x{:x} was locked by another prover but expired unfulfilled, setting status to pending proving", order.request.id);
                 candidate_orders.push(order);
             }
+        } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
+            self.skip_order(&order, "insufficient deadline").await;
+        } else if is_target_time_reached(&order, current_block_timestamp) {
+            candidate_orders.push(order);
         }
-
-        for (_, order) in self.lock_and_prove_cache.iter() {
-            let is_lock_expired = order.request.lock_expires_at() < current_block_timestamp;
-            if is_lock_expired {
-                tracing::debug!("Request {:x} was scheduled to be locked by us, but its lock has now expired. Skipping.", order.request.id);
-                self.skip_order(&order, "lock expired before we locked").await;
-            } else if let Some((locker, _)) =
-                self.db.get_request_locked(U256::from(order.request.id)).await?
-            {
-                let our_address = self.provider.default_signer_address().to_string().to_lowercase();
-                let locker_address = locker.to_lowercase();
-                // Compare normalized addresses (lowercase without 0x prefix)
-                let our_address_normalized = our_address.trim_start_matches("0x");
-                let locker_address_normalized = locker_address.trim_start_matches("0x");
-
-                if locker_address_normalized != our_address_normalized {
-                    tracing::debug!("Request 0x{:x} was scheduled to be locked by us ({}), but is already locked by another prover ({}). Skipping.", order.request.id, our_address, locker_address);
-                    self.skip_order(&order, "locked by another prover").await;
-                } else {
-                    // Edge case where we locked the order, but due to some reason was not moved to proving state. Should not happen.
-                    tracing::debug!("Request 0x{:x} was scheduled to be locked by us, but is already locked by us. Proceeding to prove.", order.request.id);
-                    candidate_orders.push(order);
-                }
-            } else if !is_within_deadline(&order, current_block_timestamp, min_deadline) {
-                self.skip_order(&order, "insufficient deadline").await;
-            } else if is_target_time_reached(&order, current_block_timestamp) {
-                candidate_orders.push(order);
-            }
-        }
-
-        if candidate_orders.is_empty() {
-            tracing::trace!(
-                "No orders to lock and/or prove as of block timestamp {}",
-                current_block_timestamp
-            );
-            return Ok(Vec::new());
-        }
-
-        tracing::debug!(
-            "Valid orders that reached target timestamp; ready for locking/proving, num: {}, ids: {}",
-            candidate_orders.len(),
-            candidate_orders.iter().map(|order| order.id()).collect::<Vec<_>>().join(", ")
-        );
-
-        Ok(candidate_orders)
     }
+
+    if candidate_orders.is_empty() {
+        tracing::trace!(
+            "No orders to lock and/or prove as of block timestamp {}",
+            current_block_timestamp
+        );
+        return Ok(Vec::new());
+    }
+
+    tracing::debug!(
+        "Valid orders that reached target timestamp; ready for locking/proving, num: {}, ids: {}",
+        candidate_orders.len(),
+        candidate_orders.iter().map(|order| order.id()).collect::<Vec<_>>().join(", ")
+    );
+
+    Ok(candidate_orders)
+}
 
     async fn lock_and_prove_orders(&self, orders: &[Arc<OrderRequest>]) -> Result<()> {
         let lock_jobs = orders.iter().map(|order| {
